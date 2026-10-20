@@ -1,0 +1,237 @@
+# Binance avgPrice
+
+Тестовое задание: Java 21, Spring Boot 3.5.7, Maven, PostgreSQL 16, Flyway.
+Сервис регулярно получает `GET /api/v3/avgPrice?symbol=BNBUSDT`, сохраняет
+полученную цену и предоставляет четыре REST endpoint.
+
+## Быстрый запуск
+
+Нужен Docker с Compose v2. Из корня проекта:
+
+```sh
+docker compose up --build -d
+docker compose logs -f app
+curl http://localhost:8080/actuator/health
+curl http://localhost:8080/api/v1/prices/latest
+```
+
+Первый опрос происходит после старта приложения; последующие — через `PT30S`
+после окончания предыдущего запуска (fixed delay). При первом запросе, пока
+цена ещё не сохранена, latest возвращает 404. Интернет-доступ к Binance
+обязателен для сбора цен; региональные ограничения Binance могут приводить к 403/451.
+API key для публичного endpoint не нужен.
+
+Остановка без удаления данных: `docker compose down`.
+PostgreSQL и файл состояния опроса размещены в отдельных именованных томах.
+Не удаляйте эти тома, если необходимо сохранить историю и незаписанную цену.
+Пароль `prices` — локальное демонстрационное значение; собственные параметры
+можно задать в `.env` (образец `.env.example`, сам `.env` исключён из Git).
+
+## Локальная разработка
+
+Нужны JDK 21, доступ к Maven Central и Docker для PostgreSQL и интеграционных тестов.
+Maven Wrapper включён. В Linux/macOS используйте `bash mvnw`; в Windows — `.\mvnw.cmd`.
+
+```sh
+docker compose up -d postgres
+bash mvnw spring-boot:run
+```
+
+Или после сборки:
+
+```sh
+bash mvnw clean verify
+java -jar target/binance-avgprice-1.0.0.jar
+```
+
+## API
+
+Все запросы читают **только сохранённые данные**, не вызывая Binance.
+Пара одна, задаётся `BINANCE_SYMBOL`; предыдущие записи других пар не смешиваются с текущей.
+Даты запроса — ISO-8601 timestamp с зоной, рекомендуется UTC `Z`.
+Интервал `[from, to]` включает обе границы. `from = to` допустимо.
+Числа цены передаются JSON-числами; клиенты должны использовать decimal, если важна точность.
+`fetchedAt` — время получения HTTP-ответа в UTC, до секунд, а не `closeTime` последней сделки.
+
+### 1. Последняя запись
+
+```sh
+curl 'http://localhost:8080/api/v1/prices/latest'
+```
+
+```json
+{"symbol":"BNBUSDT","price":10.2,"fetchedAt":"2026-09-01T00:00:00Z"}
+```
+
+### 2. Средняя цена
+
+```sh
+curl 'http://localhost:8080/api/v1/prices/average?from=2026-09-01T00:00:00Z&to=2026-09-30T23:59:59Z'
+```
+
+```json
+{"averagePrice":15.2}
+```
+
+Арифметическое среднее сохранённых наблюдений, не среднее по сделкам и не среднее,
+взвешенное по времени. PostgreSQL `AVG(NUMERIC)` не использует floating point;
+результат округляется до 18 знаков после запятой с `HALF_UP`.
+
+### 3. История с пагинацией
+
+```sh
+curl 'http://localhost:8080/api/v1/prices?from=2026-09-01T00:00:00Z&to=2026-09-30T23:59:59Z&page=0&size=20'
+```
+
+```json
+{
+  "items":[{"symbol":"BNBUSDT","price":10.2,"fetchedAt":"2026-09-01T00:00:00Z"}],
+  "page":0,
+  "size":20,
+  "totalElements":1,
+  "hasNext":false
+}
+```
+
+`page >= 0`, `1 <= size <= 1000`, значения по умолчанию 0 и 20.
+Сортировка `fetched_at ASC, id ASC` гарантирует устойчивый порядок при одинаковом времени.
+Список и count читаются в одной транзакции `REPEATABLE_READ`.
+Между отдельными запросами страниц новые записи могут менять результат: API не выдаёт snapshot token.
+
+### 4. Тренд
+
+```sh
+curl 'http://localhost:8080/api/v1/prices/trend?from=2026-09-01T00:00:00Z&to=2026-09-30T23:59:59Z'
+```
+
+```json
+{"symbol":"BNBUSDT","start_date":"2026-09-01","end_date":"2026-09-30","trend":"UPWARD"}
+```
+
+ТЗ не задаёт математический алгоритм тренда. Здесь сравниваются последняя и первая
+цены в интервале: больше → `UPWARD`, меньше → `DOWNWARD`, равны → `FLAT`.
+Для одного наблюдения результат `FLAT`. Сравнение точное через `BigDecimal.compareTo`,
+без произвольного epsilon. Промежуточные колебания не влияют на этот алгоритм.
+`start_date` и `end_date` — UTC-даты границ запроса, как в формате ответа ТЗ.
+
+### Ошибки REST
+
+* 400: отсутствует параметр, неверный timestamp, `from > to`, неверная пагинация.
+* 404: нет данных для latest, average или trend.
+* 200 с пустым `items`: нет истории или страница за пределами результата.
+* 503: БД временно недоступна.
+
+Ошибки оформлены как `application/problem+json` (Spring ProblemDetail), без SQL и
+внутренних stack trace в ответах. Детали сбоев БД остаются в серверных логах.
+
+## Конфигурация
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `BINANCE_SYMBOL` | `BNBUSDT` | Одна опрашиваемая пара, 2–32 символа A–Z/0–9 |
+| `BINANCE_POLL_INTERVAL` | `PT30S` | ISO-8601 fixed delay, минимум `PT1S` |
+| `BINANCE_BASE_URL` | `https://api.binance.com` | Адрес API, можно заменить тестовым сервером |
+| `BINANCE_CONNECT_TIMEOUT` | `PT3S` | Таймаут соединения |
+| `BINANCE_READ_TIMEOUT` | `PT5S` | Общий таймаут HTTP-запроса |
+| `BINANCE_ENABLED` | `true` | Включить scheduler |
+| `BINANCE_STATE_DIR` | `./data` | Каталог durable state; в Compose `/data` |
+| `DB_URL` | `jdbc:postgresql://localhost:5432/prices` | JDBC URL; Compose использует хост postgres |
+| `DB_USER` | `prices` | Пользователь PostgreSQL |
+| `DB_PASSWORD` | `prices` | Пароль PostgreSQL |
+| `SERVER_PORT` | `8080` | Порт при локальном запуске |
+
+В Compose порт приложения фиксирован 8080; для другого внешнего порта измените `ports`.
+Интервалы и таймауты проверяются при запуске. Миграции Flyway выполняются автоматически.
+
+## Ошибки Binance, rate limits, сохранность
+
+Официальные источники:
+[avgPrice](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market#avg-price),
+[HTTP errors и limits](https://developers.binance.com/en/docs/products/spot/rest-api).
+Вес запроса avgPrice — 2. Лимиты общие для IP, и их расход могут увеличивать другие приложения.
+Значения заголовков `X-MBX-USED-WEIGHT-*` доступны в DEBUG-логах BinanceClient.
+Глобальный лимит IP не зашит в код: он зависит от актуальных правил биржи и других клиентов.
+
+* 429/418: нет повторов до `Retry-After`. При отсутствующем/невалидном заголовке
+  используются консервативные паузы 1 минута / 3 дня соответственно.
+* Прочие 4xx (включая 400, 403, 451): минимум 5 минут, ошибка и Binance code пишутся в лог.
+  Неверную пару или региональную блокировку должен исправить оператор.
+* 5xx, сеть, timeout, некорректный JSON/price: повтор на последующих тиках,
+  экспоненциальная пауза 30–300 секунд. Валидный `Retry-After` никогда не сокращается.
+* Состояние паузы хранится на диске: обычный restart не обходит бан.
+* Один scheduler выполняет запросы последовательно. Никаких повторных INSERT
+  вследствие повторного запроса HTTP внутри одного тика.
+* Успешно полученная цена сначала записывается в файл состояния с `force(true)` и
+  атомарной заменой, затем вставляется в БД. Pending удаляется только после успешной
+  записи. При сбое БД следующий тик повторяет **ту же** запись, без нового запроса к Binance.
+* UUID наблюдения является ключом идемпотентности; `ON CONFLICT (id) DO NOTHING`
+  исключает дубликат при неопределённом результате commit или сбое очистки файла.
+  Одинаковые цены разных опросов — разные валидные наблюдения.
+
+Границы гарантий: проект рассчитан на **один экземпляр сборщика** и постоянный том
+состояния. Это не распределённая очередь. Пока pending не доставлен в БД, сбор новых
+цен приостановлен; исторические пропущенные значения avgPrice восстановить нельзя.
+Неудачный запрос не создаёт фиктивную запись. Авария процесса между HTTP-ответом и
+первой записью на диск, отказ диска/питания или удаление тома не покрываются гарантией
+сохранения. Абсолютное exactly-once получение внешнего HTTP-ответа невозможно обеспечить
+локальной транзакцией. При ошибке диска scheduler сохраняет pending в памяти и не
+получает следующую цену до успешного сохранения.
+
+## Структура и решения
+
+```text
+src/main/java/com/example/prices/
+  PriceController         HTTP-контракт
+  PriceService            интервалы, average, pagination, trend
+  PriceRepository         параметризованный SQL и идемпотентный INSERT
+  BinanceClient           HTTP, BigDecimal, timeout, классификация ошибок
+  PricePoller              расписание, backoff, последовательность сохранения
+  PollStateStore          атомарное файловое состояние
+  ApiExceptionHandler     единые REST-ошибки
+src/main/resources/db/migration/   схема Flyway
+src/test/java/                    unit, WireMock, Testcontainers
+.github/workflows/ci.yml          проверка каждого push/PR
+```
+
+Spring JDBC выбран вместо ORM: пять простых запросов, точный контроль `NUMERIC`,
+сортировки, `AVG` и `ON CONFLICT`, без лишних сущностей и lazy loading.
+`NUMERIC` без фиксированного scale не округляет исходную цену при INSERT.
+`TIMESTAMPTZ` хранит момент времени; наружу сериализуется UTC.
+Индекс `(symbol, fetched_at, id)` обслуживает выборки по паре и интервалу.
+Clock внедряется для детерминированных тестов.
+
+## Тесты
+
+```sh
+bash mvnw test          # unit + HTTP-контракт Binance через WireMock, Docker не нужен
+bash mvnw verify        # дополнительно PriceApiIT, настоящий PostgreSQL через Testcontainers
+```
+
+Интеграционные тесты не пропускаются автоматически при отсутствии Docker:
+`verify` должен завершиться ошибкой, если инфраструктура недоступна.
+Проверяются четыре endpoint, Flyway, включённые границы, фильтрация пары,
+пагинация, пустые ответы, 400/404, точность decimal, идемпотентность,
+сохранение pending при сбое БД и cooldown после restart.
+Тесты не обращаются к настоящему Binance и не требуют секретов.
+CI запускает `verify` на GitHub Actions Ubuntu с Docker.
+
+Для совместимости с Docker Engine 29 клиенту Testcontainers задан API 1.44.
+Требуется Docker Engine 25+; при необходимости версия клиента переопределяется через
+`-Ddocker.api.version=...`. Это параметр клиента тестов, не приложения.
+Результаты фактической проверки поставки см. `VERIFICATION.md`.
+
+## Публикация на GitHub
+
+Проект готов для нового репозитория. Сначала создайте пустой репозиторий и замените URL:
+
+```sh
+git init
+git add .
+git commit -m "Implement Binance average price service"
+git branch -M main
+git remote add origin https://github.com/YOUR_ACCOUNT/binance-avgprice.git
+git push -u origin main
+```
+
+**Push требует доступа к репозиторию и авторизации GitHub.**
+В архиве нет токенов, `.env`, локальных данных, Maven-кэша и каталога `target`.

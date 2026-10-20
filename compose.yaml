@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: prices
+      POSTGRES_USER: ${DB_USER:-prices}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-prices}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d prices"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+  app:
+    build: .
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/prices
+      DB_USER: ${DB_USER:-prices}
+      DB_PASSWORD: ${DB_PASSWORD:-prices}
+      BINANCE_SYMBOL: ${BINANCE_SYMBOL:-BNBUSDT}
+      BINANCE_POLL_INTERVAL: ${BINANCE_POLL_INTERVAL:-PT30S}
+      BINANCE_BASE_URL: ${BINANCE_BASE_URL:-https://api.binance.com}
+      BINANCE_ENABLED: ${BINANCE_ENABLED:-true}
+      BINANCE_CONNECT_TIMEOUT: ${BINANCE_CONNECT_TIMEOUT:-PT3S}
+      BINANCE_READ_TIMEOUT: ${BINANCE_READ_TIMEOUT:-PT5S}
+      BINANCE_STATE_DIR: /data
+    ports:
+      - "8080:8080"
+    volumes:
+      - poll-state:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  postgres-data:
+  poll-state:

@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: binance-avgprice
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/prices}
+    username: ${DB_USER:prices}
+    password: ${DB_PASSWORD:prices}
+    hikari:
+      connection-timeout: 5000
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+binance:
+  base-url: ${BINANCE_BASE_URL:https://api.binance.com}
+  symbol: ${BINANCE_SYMBOL:BNBUSDT}
+  poll-interval: ${BINANCE_POLL_INTERVAL:PT30S}
+  connect-timeout: ${BINANCE_CONNECT_TIMEOUT:PT3S}
+  read-timeout: ${BINANCE_READ_TIMEOUT:PT5S}
+  enabled: ${BINANCE_ENABLED:true}
+  state-dir: ${BINANCE_STATE_DIR:./data}
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
